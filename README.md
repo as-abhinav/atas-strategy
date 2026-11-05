@@ -32,3 +32,19 @@ Copy the built `AtasStrategies.dll` to `%APPDATA%\ATAS\Strategies` (strategies) 
 
 - Project setup: https://docs.atas.net/en/getting-started/project-setup.html
 - Chart strategies: https://docs.atas.net/en/chart-strategies/overview.html
+
+## Core logic and tests
+
+Pure C# rules live in `Core/` (no ATAS references, so they test on any machine). Unit tests are in `Tests/` (xUnit).
+
+```bash
+dotnet test Tests/AtasStrategies.Tests.csproj
+```
+
+Current coverage: level proximity, swing pivots, previous-day and weekly levels, daily/weekly aggregation, big-trade thresholds and absorption, CVD divergence, footprint auction checks, and the signal checklist (37 tests, all passing).
+
+## Strategy
+
+`Strategies/KeyLevelOrderFlowStrategy.cs` is the ATAS chart strategy (signal only, no orders). It builds daily and weekly levels from the chart's own bars, evaluates each closed bar, draws markers, and appends each signal to `%APPDATA%\ATAS\Logs\KeyLevelSignals.csv`.
+
+Verified: the strategy compiles against stub ATAS types. Not yet verified: the real ATAS API calls (`IndicatorCandle` field types, `MarketDataArg`, `ValueDataSeries`, `RaiseShowNotification`) and behavior on a live chart. Those need the ATAS DLLs on Windows.

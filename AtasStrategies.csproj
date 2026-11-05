@@ -7,12 +7,18 @@
     <RootNamespace>AtasStrategies</RootNamespace>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <ImplicitUsings>disable</ImplicitUsings>
+    <ImplicitUsings>enable</ImplicitUsings>
 
     <!-- Folder where classic ATAS is installed.
          Override on the command line, e.g.  dotnet build -p:ATAS_BASE="D:\ATAS Platform" -->
     <ATAS_BASE Condition="'$(ATAS_BASE)' == ''">C:\Program Files (x86)\ATAS Platform</ATAS_BASE>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Core rules are compiled into this plugin (one DLL, no extra dependency to install).
+         Exclude the standalone Core/Tests projects and samples from the plugin build. -->
+    <Compile Remove="Core/bin/**;Core/obj/**;Tests/**;Samples/**" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- ATAS.Indicators is the only required reference. -->
