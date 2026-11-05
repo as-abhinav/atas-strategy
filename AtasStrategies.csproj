@@ -1,8 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- Classic ATAS on Windows runs .NET 10. Add UseWPF only if you use WPF types. -->
+    <!-- Classic ATAS on Windows runs .NET 10. UseWPF is needed: ATAS colors are WPF types. -->
     <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
     <AssemblyName>AtasStrategies</AssemblyName>
     <RootNamespace>AtasStrategies</RootNamespace>
     <Nullable>enable</Nullable>
