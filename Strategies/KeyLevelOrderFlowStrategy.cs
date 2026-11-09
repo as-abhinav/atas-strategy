@@ -42,6 +42,10 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
     private const int VolumeSampleSize = 5000;
     private const string SignalLogFileName = "KeyLevelSignals.csv";
     private const string DiagnosticLogFileName = "KeyLevelDiagnostics.csv";
+    private const string TraceLogFileName = "KeyLevelTrace.log";
+
+    // Bump this when you rebuild, so the trace log proves which DLL ATAS is running.
+    private const string BuildTag = "2026-11-09 trace-log";
 
     private const string SignalLogHeader =
         "time,contract,side,level_kind,level_price,bar_close,big_buy_count,big_buy_volume," +
@@ -65,6 +69,13 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
     private IReadOnlyList<KeyLevel> _levels = Array.Empty<KeyLevel>();
     private int _nextBarToAggregate;
     private int _lastEvaluatedIndex = -1;
+
+    // Counters and state for the trace log.
+    private int _calculateCalls;
+    private int _evaluations;
+    private int _tradeCallbacks;
+    private bool _liveBarTraced;
+    private DateTime _lastHeartbeatUtc = DateTime.MinValue;
 
     [Display(Name = "Instrument", GroupName = "Instrument", Order = 10)]
     [OFT.Attributes.Parameter]
@@ -155,39 +166,62 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
             Color = System.Drawing.Color.Red.Convert(),
         };
         DataSeries.Add(_shortSignals);
+
+        Trace($"Strategy created. Build: {BuildTag}.");
     }
 
     protected override void OnCalculate(int bar, decimal value)
     {
-        if (bar == 0)
-        {
-            ResetHistoryState();
-        }
-
-        // Aggregate every bar that has closed, in order. Repeated ticks on the live bar are ignored here.
-        while (_nextBarToAggregate < bar)
-        {
-            AggregateClosedBar(_nextBarToAggregate);
-            _nextBarToAggregate++;
-        }
-
-        // Evaluate the bar that just closed, once, when a new live bar appears.
-        bool isLiveBar = bar == CurrentBar - 1;
-        if (!isLiveBar || bar < 1 || ExecutionMode != ExecutionModeChoice.SignalOnly)
-            return;
-
-        int closedIndex = bar - 1;
-        if (closedIndex == _lastEvaluatedIndex)
-            return;
-        _lastEvaluatedIndex = closedIndex;
-
         try
         {
+            _calculateCalls++;
+            if (_calculateCalls <= 3)
+                Trace($"OnCalculate call #{_calculateCalls}: bar={bar}, CurrentBar={CurrentBar}.");
+
+            if (bar == 0)
+            {
+                ResetHistoryState();
+                Trace($"History calculation started. CurrentBar={CurrentBar}.");
+            }
+
+            // Aggregate every bar that has closed, in order. Repeated ticks on the live bar are ignored here.
+            while (_nextBarToAggregate < bar)
+            {
+                AggregateClosedBar(_nextBarToAggregate);
+                _nextBarToAggregate++;
+            }
+
+            TraceHeartbeat(bar);
+
+            // Evaluate the bar that just closed, once, when a new live bar appears.
+            // ">=" so this also works if CurrentBar turns out to be the last index rather than the count.
+            bool isLiveBar = bar >= CurrentBar - 1;
+            if (!isLiveBar || bar < 1 || ExecutionMode != ExecutionModeChoice.SignalOnly)
+                return;
+
+            if (!_liveBarTraced)
+            {
+                _liveBarTraced = true;
+                string message =
+                    $"First live bar reached: bar={bar}, CurrentBar={CurrentBar}, bars aggregated={_nextBarToAggregate}, " +
+                    $"daily bars={_daily.Completed.Count}, weekly bars={_weekly.Completed.Count}, levels={_levels.Count}.";
+                Trace(message);
+                RaiseShowNotification($"Key level strategy running (build {BuildTag}). Levels: {_levels.Count}. Trace log: %APPDATA%\\ATAS\\Logs\\{TraceLogFileName}");
+            }
+
+            int closedIndex = bar - 1;
+            if (closedIndex == _lastEvaluatedIndex)
+                return;
+            _lastEvaluatedIndex = closedIndex;
+
             EvaluateClosedBar(closedIndex, bar);
+            _evaluations++;
+            Trace($"Evaluated closed bar {closedIndex}. Total evaluations: {_evaluations}.");
         }
         catch (Exception ex)
         {
-            this.LogError("Key level evaluation failed.", ex);
+            Trace($"ERROR in OnCalculate (bar={bar}): {ex}");
+            this.LogError("Key level strategy failed.", ex);
         }
     }
 
@@ -207,6 +241,10 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
 
     private void TrackAggregatedTrade(CumulativeTrade trade, bool isNew)
     {
+        _tradeCallbacks++;
+        if (_tradeCallbacks <= 5)
+            Trace($"Aggregated trade callback #{_tradeCallbacks}: direction={trade.Direction}, volume={trade.Volume}, firstPrice={trade.FirstPrice}, time={trade.Time:HH:mm:ss}.");
+
         // Compared by name so this does not depend on which TradeDirection enum ATAS uses here.
         string direction = trade.Direction.ToString();
         bool isBuy = string.Equals(direction, "Buy", StringComparison.OrdinalIgnoreCase);
@@ -438,6 +476,43 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         catch (Exception ex)
         {
             this.LogError($"Could not write {fileName}.", ex);
+        }
+    }
+
+    private void TraceHeartbeat(int bar)
+    {
+        var now = DateTime.UtcNow;
+        if (now - _lastHeartbeatUtc < TimeSpan.FromSeconds(60)) return;
+        _lastHeartbeatUtc = now;
+
+        Trace(
+            $"Heartbeat: calls={_calculateCalls}, bar={bar}, CurrentBar={CurrentBar}, levels={_levels.Count}, " +
+            $"evaluations={_evaluations}, lastEvaluatedIndex={_lastEvaluatedIndex}, " +
+            $"aggregatedTradeCallbacks={_tradeCallbacks}, tradesBuffered={_aggregatedTrades.Count}.");
+    }
+
+    /// <summary>Always-on trace log. Never throws: logging must not break the strategy.</summary>
+    private static void Trace(string message)
+    {
+        string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}";
+        string[] folders =
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ATAS", "Logs"),
+            Path.GetTempPath(),
+        };
+
+        foreach (string folder in folders)
+        {
+            try
+            {
+                Directory.CreateDirectory(folder);
+                File.AppendAllText(Path.Combine(folder, TraceLogFileName), line + Environment.NewLine);
+                return;
+            }
+            catch (Exception)
+            {
+                // Try the next folder.
+            }
         }
     }
 
