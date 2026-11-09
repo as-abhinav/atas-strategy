@@ -6,7 +6,7 @@ namespace AtasStrategies.Core;
 /// </summary>
 public static class InstrumentPresets
 {
-    public static InstrumentSettings Es { get; } = new("ES", TickSize: 0.25m, ProximityTicks: 6, BigTradeAbsoluteMin: 25m, BigTradePercentile: 0.99m);
+    public static InstrumentSettings Es { get; } = new("ES", TickSize: 0.25m, ProximityTicks: 6, BigTradeAbsoluteMin: 300m, BigTradePercentile: 0.99m);
 
-    public static InstrumentSettings Nq { get; } = new("NQ", TickSize: 0.25m, ProximityTicks: 12, BigTradeAbsoluteMin: 40m, BigTradePercentile: 0.99m);
+    public static InstrumentSettings Nq { get; } = new("NQ", TickSize: 0.25m, ProximityTicks: 12, BigTradeAbsoluteMin: 300m, BigTradePercentile: 0.99m);
 }

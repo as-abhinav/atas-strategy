@@ -32,7 +32,8 @@ public enum ExecutionModeChoice
 
 /// <summary>
 /// Signal-only key-level order-flow strategy. Places no orders.
-/// Evaluates the last closed bar against daily/weekly levels and writes a log line per signal.
+/// Evaluates each closed bar against daily/weekly levels and writes a log line per signal.
+/// With "Diagnostic log" on, it also records why each touched level was rejected.
 /// </summary>
 [DisplayName("Key level order flow (signal only)")]
 [Category("AtasStrategies")]
@@ -40,6 +41,15 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
 {
     private const int VolumeSampleSize = 5000;
     private const string SignalLogFileName = "KeyLevelSignals.csv";
+    private const string DiagnosticLogFileName = "KeyLevelDiagnostics.csv";
+
+    private const string SignalLogHeader =
+        "time,contract,side,level_kind,level_price,bar_close,big_buy_count,big_buy_volume," +
+        "big_sell_count,big_sell_volume,divergence,auction_checks,reasons";
+
+    private const string DiagnosticLogHeader =
+        "time,row_type,level_kind,level_price,side,levels_total,levels_active,trades_in_bar," +
+        "max_trade_volume,threshold,big_buy_volume,big_sell_volume,reasons";
 
     private readonly ValueDataSeries _longSignals;
     private readonly ValueDataSeries _shortSignals;
@@ -47,11 +57,14 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
     private readonly PeriodAggregator _daily = new(PeriodKeys.Day);
     private readonly PeriodAggregator _weekly = new(PeriodKeys.Week);
     private readonly HashSet<string> _signaledThisSession = new();
-    private readonly List<Trade> _tradeBuffer = new();
+
+    // Aggregated (cumulative) trades, keyed so that updates to the same trade overwrite it.
+    private readonly Dictionary<string, Trade> _aggregatedTrades = new();
     private readonly List<decimal> _volumeSample = new();
 
     private IReadOnlyList<KeyLevel> _levels = Array.Empty<KeyLevel>();
     private int _nextBarToAggregate;
+    private int _lastEvaluatedIndex = -1;
 
     [Display(Name = "Instrument", GroupName = "Instrument", Order = 10)]
     [OFT.Attributes.Parameter]
@@ -62,16 +75,16 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
     [OFT.Attributes.Parameter]
     public int ProximityTicksOverride { get; set; }
 
-    [Display(Name = "Big trade min volume (0 = preset)", GroupName = "Instrument", Order = 30)]
-    [Range(0, 1000000)]
+    [Display(Name = "Big trade threshold (contracts)", GroupName = "Big trades", Order = 10)]
+    [Range(1, 1000000)]
     [OFT.Attributes.Parameter]
-    public decimal BigTradeMinOverride { get; set; }
+    public decimal BigTradeThreshold { get; set; } = 300m;
 
-    [Display(Name = "Big trade threshold mode", GroupName = "Big trades", Order = 10)]
+    [Display(Name = "Big trade threshold mode", GroupName = "Big trades", Order = 20)]
     [OFT.Attributes.Parameter]
-    public BigTradeThresholdMode BigTradeMode { get; set; } = BigTradeThresholdMode.Both;
+    public BigTradeThresholdMode BigTradeMode { get; set; } = BigTradeThresholdMode.Absolute;
 
-    [Display(Name = "Big trade percentile (0-1)", GroupName = "Big trades", Order = 20)]
+    [Display(Name = "Big trade percentile (0-1)", GroupName = "Big trades", Order = 30)]
     [Range(0, 1)]
     [OFT.Attributes.Parameter]
     public decimal BigTradePercentile { get; set; } = 0.99m;
@@ -114,11 +127,15 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
     [Display(Name = "Min footprint checks", GroupName = "Order flow", Order = 40)]
     [Range(1, 4)]
     [OFT.Attributes.Parameter]
-    public int MinAuctionEvidence { get; set; } = 2;
+    public int MinAuctionEvidence { get; set; } = 1;
 
     [Display(Name = "Draw signals", GroupName = "Visuals", Order = 10)]
     [OFT.Attributes.Parameter]
     public bool DrawSignals { get; set; } = true;
+
+    [Display(Name = "Diagnostic log", GroupName = "Visuals", Order = 20)]
+    [OFT.Attributes.Parameter]
+    public bool DiagnosticLog { get; set; } = true;
 
     [Display(Name = "Execution mode", GroupName = "Execution", Order = 10)]
     [OFT.Attributes.Parameter]
@@ -154,14 +171,19 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
             _nextBarToAggregate++;
         }
 
-        // Evaluate the bar that just closed, once per new live bar.
+        // Evaluate the bar that just closed, once, when a new live bar appears.
         bool isLiveBar = bar == CurrentBar - 1;
         if (!isLiveBar || bar < 1 || ExecutionMode != ExecutionModeChoice.SignalOnly)
             return;
 
+        int closedIndex = bar - 1;
+        if (closedIndex == _lastEvaluatedIndex)
+            return;
+        _lastEvaluatedIndex = closedIndex;
+
         try
         {
-            EvaluateClosedBar(bar - 1, bar);
+            EvaluateClosedBar(closedIndex, bar);
         }
         catch (Exception ex)
         {
@@ -169,18 +191,41 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         }
     }
 
-    protected override void OnNewTrade(MarketDataArg trade)
+    // Big trades are aggregated market orders (one sweep = one trade), not individual prints.
+    // A single print of hundreds of contracts is very rare, so tick-level detection almost never fires.
+    protected override void OnCumulativeTrade(CumulativeTrade trade)
     {
-        base.OnNewTrade(trade);
+        base.OnCumulativeTrade(trade);
+        TrackAggregatedTrade(trade, isNew: true);
+    }
 
-        if (trade.DataType != MarketDataType.Trade || trade.Direction == TradeDirection.Between)
-            return;
+    protected override void OnUpdateCumulativeTrade(CumulativeTrade trade)
+    {
+        base.OnUpdateCumulativeTrade(trade);
+        TrackAggregatedTrade(trade, isNew: false);
+    }
 
-        _tradeBuffer.Add(new Trade(trade.Time, trade.Price, trade.Volume, trade.Direction == TradeDirection.Buy));
+    private void TrackAggregatedTrade(CumulativeTrade trade, bool isNew)
+    {
+        // Compared by name so this does not depend on which TradeDirection enum ATAS uses here.
+        string direction = trade.Direction.ToString();
+        bool isBuy = string.Equals(direction, "Buy", StringComparison.OrdinalIgnoreCase);
+        bool isSell = string.Equals(direction, "Sell", StringComparison.OrdinalIgnoreCase);
+        if (!isBuy && !isSell) return;
 
-        _volumeSample.Add(trade.Volume);
-        if (_volumeSample.Count > VolumeSampleSize)
-            _volumeSample.RemoveAt(0);
+        decimal volume = (decimal)trade.Volume;
+        decimal price = (decimal)trade.FirstPrice;
+        string key = $"{trade.Time.Ticks}|{(isBuy ? 'B' : 'S')}|{price}";
+
+        bool known = _aggregatedTrades.ContainsKey(key);
+        _aggregatedTrades[key] = new Trade(trade.Time, price, volume, isBuy);
+
+        if (isNew && !known)
+        {
+            _volumeSample.Add(volume);
+            if (_volumeSample.Count > VolumeSampleSize)
+                _volumeSample.RemoveAt(0);
+        }
     }
 
     private void ResetHistoryState()
@@ -190,6 +235,7 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         _signaledThisSession.Clear();
         _levels = Array.Empty<KeyLevel>();
         _nextBarToAggregate = 0;
+        _lastEvaluatedIndex = -1;
     }
 
     private void AggregateClosedBar(int index)
@@ -197,7 +243,7 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         var candle = GetCandle(index);
         var closed = ToBar(candle);
 
-        bool newWeek = _weekly.Add(closed);
+        _weekly.Add(closed);
         bool newDay = _daily.Add(closed);
         if (newDay)
         {
@@ -215,7 +261,7 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
 
     private void EvaluateClosedBar(int index, int liveBar)
     {
-        if (index < 1 || _levels.Count == 0) return;
+        if (index < 1) return;
 
         var candle = GetCandle(index);
         var previous = GetCandle(index - 1);
@@ -225,11 +271,13 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
 
         decimal zoneHalfWidth = settings.ProximityTicks * settings.TickSize;
 
-        // Trades that happened while the evaluated bar was forming.
+        // Aggregated trades that started while the evaluated bar was forming.
         var windowStart = candle.Time;
         var windowEnd = GetCandle(liveBar).Time;
         PruneTradesBefore(windowStart);
-        var windowTrades = _tradeBuffer.Where(t => t.Time >= windowStart && t.Time < windowEnd).ToList();
+        var windowTrades = _aggregatedTrades.Values
+            .Where(t => t.Time >= windowStart && t.Time < windowEnd)
+            .ToList();
 
         decimal threshold = BigTrades.Threshold(
             _volumeSample, settings.BigTradeAbsoluteMin, settings.BigTradePercentile, BigTradeMode);
@@ -238,6 +286,8 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         var divergenceLong = DetectDivergence(index, bullish: true);
         var divergenceShort = DetectDivergence(index, bullish: false);
 
+        int activeLevels = 0;
+
         foreach (var level in _levels)
         {
             if (_signaledThisSession.Contains(LevelKey(level))) continue;
@@ -245,6 +295,7 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
             bool touched = closed.Low - zoneHalfWidth <= level.Price && level.Price <= closed.High + zoneHalfWidth;
             bool active = touched || LevelProximity.IsActive(closed.Close, level.Price, settings.TickSize, settings.ProximityTicks);
             if (!active) continue;
+            activeLevels++;
 
             Side side = closed.Close >= level.Price ? Side.Long : Side.Short;
             bool isLong = side == Side.Long;
@@ -260,10 +311,23 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
             var auction = FootprintAuction.Evaluate(footprint, level.Price, side, AbsorptionShare);
             var decision = SignalEvaluator.Decide(side, active, candidate, divergence, auction, MinAuctionEvidence);
 
-            if (!decision.IsSignal) continue;
+            if (!decision.IsSignal)
+            {
+                if (DiagnosticLog)
+                {
+                    WriteDiagnostic(closed.Time, "rejected", level, side, null, null, windowTrades, threshold, summary, decision.Reasons);
+                }
+                continue;
+            }
 
             _signaledThisSession.Add(LevelKey(level));
             PublishSignal(index, level, side, closed, summary, divergence, auction, decision);
+        }
+
+        if (DiagnosticLog)
+        {
+            var totals = BigTrades.Summarize(windowTrades, threshold, decimal.MinValue, decimal.MaxValue);
+            WriteDiagnostic(closed.Time, "bar", null, null, _levels.Count, activeLevels, windowTrades, threshold, totals, Array.Empty<string>());
         }
     }
 
@@ -305,53 +369,75 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         string sideText = side == Side.Long ? "LONG" : "SHORT";
         RaiseShowNotification($"{sideText} signal at {level.Kind} {level.Price} ({Contract}).");
 
-        WriteSignalLog(closed, level, side, summary, divergence, auction, decision);
+        string reasons = string.Join(" | ", decision.Reasons).Replace("\"", "'");
+        string line = string.Join(",",
+            closed.Time.ToString("yyyy-MM-dd HH:mm:ss"),
+            Contract,
+            side,
+            level.Kind,
+            level.Price,
+            closed.Close,
+            summary.BuyCount,
+            summary.BuyVolume,
+            summary.SellCount,
+            summary.SellVolume,
+            divergence?.Description ?? "none",
+            auction.Count,
+            "\"" + reasons + "\"");
+
+        AppendCsv(SignalLogFileName, SignalLogHeader, line);
     }
 
-    private void WriteSignalLog(
-        Bar closed,
-        KeyLevel level,
-        Side side,
-        BigTradeSummary summary,
-        DivergenceResult? divergence,
-        AuctionEvidence auction,
-        SignalDecision decision)
+    private void WriteDiagnostic(
+        DateTime time,
+        string rowType,
+        KeyLevel? level,
+        Side? side,
+        int? levelsTotal,
+        int? levelsActive,
+        IReadOnlyList<Trade> windowTrades,
+        decimal threshold,
+        BigTradeSummary totals,
+        IReadOnlyList<string> reasons)
+    {
+        decimal maxTrade = windowTrades.Count == 0 ? 0m : windowTrades.Max(t => t.Volume);
+        string reasonText = string.Join(" | ", reasons).Replace("\"", "'");
+
+        string line = string.Join(",",
+            time.ToString("yyyy-MM-dd HH:mm:ss"),
+            rowType,
+            level?.Kind.ToString() ?? "",
+            level?.Price.ToString() ?? "",
+            side?.ToString() ?? "",
+            levelsTotal?.ToString() ?? "",
+            levelsActive?.ToString() ?? "",
+            windowTrades.Count,
+            maxTrade,
+            threshold,
+            totals.BuyVolume,
+            totals.SellVolume,
+            "\"" + reasonText + "\"");
+
+        AppendCsv(DiagnosticLogFileName, DiagnosticLogHeader, line);
+    }
+
+    private void AppendCsv(string fileName, string header, string line)
     {
         try
         {
             string folder = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ATAS", "Logs");
             Directory.CreateDirectory(folder);
-            string path = Path.Combine(folder, SignalLogFileName);
+            string path = Path.Combine(folder, fileName);
 
             if (!File.Exists(path))
-            {
-                File.WriteAllText(path,
-                    "time,contract,side,level_kind,level_price,bar_close,big_buy_count,big_buy_volume," +
-                    "big_sell_count,big_sell_volume,divergence,auction_checks,reasons" + Environment.NewLine);
-            }
-
-            string reasons = string.Join(" | ", decision.Reasons).Replace("\"", "'");
-            string line = string.Join(",",
-                closed.Time.ToString("yyyy-MM-dd HH:mm:ss"),
-                Contract,
-                side,
-                level.Kind,
-                level.Price,
-                closed.Close,
-                summary.BuyCount,
-                summary.BuyVolume,
-                summary.SellCount,
-                summary.SellVolume,
-                divergence?.Description ?? "none",
-                auction.Count,
-                "\"" + reasons + "\"");
+                File.WriteAllText(path, header + Environment.NewLine);
 
             File.AppendAllText(path, line + Environment.NewLine);
         }
         catch (Exception ex)
         {
-            this.LogError("Could not write signal log.", ex);
+            this.LogError($"Could not write {fileName}.", ex);
         }
     }
 
@@ -361,12 +447,16 @@ public class KeyLevelOrderFlowStrategy : ChartStrategy
         return preset with
         {
             ProximityTicks = ProximityTicksOverride > 0 ? ProximityTicksOverride : preset.ProximityTicks,
-            BigTradeAbsoluteMin = BigTradeMinOverride > 0 ? BigTradeMinOverride : preset.BigTradeAbsoluteMin,
+            BigTradeAbsoluteMin = BigTradeThreshold,
             BigTradePercentile = BigTradePercentile,
         };
     }
 
-    private void PruneTradesBefore(DateTime cutoff) => _tradeBuffer.RemoveAll(t => t.Time < cutoff);
+    private void PruneTradesBefore(DateTime cutoff)
+    {
+        var stale = _aggregatedTrades.Where(kv => kv.Value.Time < cutoff).Select(kv => kv.Key).ToList();
+        foreach (var key in stale) _aggregatedTrades.Remove(key);
+    }
 
     private static string LevelKey(KeyLevel level) => $"{level.Kind}:{level.Price}";
 

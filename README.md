@@ -48,3 +48,10 @@ Current coverage: level proximity, swing pivots, previous-day and weekly levels,
 `Strategies/KeyLevelOrderFlowStrategy.cs` is the ATAS chart strategy (signal only, no orders). It builds daily and weekly levels from the chart's own bars, evaluates each closed bar, draws markers, and appends each signal to `%APPDATA%\ATAS\Logs\KeyLevelSignals.csv`.
 
 Verified: the strategy compiles against stub ATAS types. Not yet verified: the real ATAS API calls (`IndicatorCandle` field types, `MarketDataArg`, `ValueDataSeries`, `RaiseShowNotification`) and behavior on a live chart. Those need the ATAS DLLs on Windows.
+
+## Key settings and logs
+
+- **Big trade threshold (contracts):** default 300. Applies to aggregated trades (one market-order sweep = one trade), not single prints. Mode defaults to Absolute; "Percentile" and "Both" are available.
+- **Min footprint checks:** default 1. Absorption cluster (heavy bid volume) and delta divergence (positive delta) contradict each other on the same bar, so requiring 2 or more rarely passes.
+- **Diagnostic log:** on by default. `%APPDATA%\ATAS\Logs\KeyLevelDiagnostics.csv` has one `bar` row per closed bar (levels, active levels, aggregated trades seen, largest trade, threshold) and one `rejected` row per touched level with the reason. Use it to tune the threshold.
+- **Signals:** `%APPDATA%\ATAS\Logs\KeyLevelSignals.csv`.
