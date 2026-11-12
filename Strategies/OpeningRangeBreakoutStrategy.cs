@@ -30,7 +30,7 @@ public enum ChartTimeZoneChoice
 public class OpeningRangeBreakoutStrategy : ChartStrategy
 {
     // Bump this when you rebuild, so the trace log proves which DLL ATAS is running.
-    private const string BuildTag = "2026-11-12 orb-4-own-position";
+    private const string BuildTag = "2026-11-12 orb-5-flatten-fix";
     private const string TraceFileName = "OpeningRangeTrace.log";
     private const string SignalFileName = "OpeningRangeSignals.csv";
     private const string SignalHeader = "bar_time_ny,bar_time_chart,direction,price,range_high,range_low,mode";
@@ -78,6 +78,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
 
     // Trace log state.
     private int _calculateCalls;
+    private int _olderBarCalls;
     private int _historicalBreakouts;
     private int _liveBreakouts;
     private bool _liveBarTraced;
@@ -252,6 +253,16 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             if (isLiveBar && _firstLiveBar < 0)
                 _firstLiveBar = bar;
 
+            // ATAS can recalculate an older bar after newer ones were processed. Such a call must not drive
+            // live decisions (its time is in the past), so it only gets counted and traced.
+            if (bar < _nextBarToProcess)
+            {
+                _olderBarCalls++;
+                if (_olderBarCalls <= 5)
+                    Trace($"OnCalculate for an older bar: bar={bar}, next bar to process={_nextBarToProcess}, CurrentBar={CurrentBar}. Ignored.");
+                return;
+            }
+
             // Process every closed bar, in order. The forming bar (index "bar") is processed once it closes.
             while (_nextBarToProcess < bar)
             {
@@ -271,7 +282,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                     TraceLiveStart(bar);
                 }
 
-                CheckSessionFlatten(bar);
+                CheckSessionFlatten();
             }
 
             TraceHeartbeat(bar);
@@ -630,13 +641,24 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         if (flatten) Flatten("exit order failed");
     }
 
-    private void CheckSessionFlatten(int liveBar)
+    /// <summary>
+    /// Closes the trade at the flatten time of its own NY day, or as soon as a later day is reached.
+    /// Uses the newest bar on the chart, never the bar being calculated (which can be an older one).
+    /// </summary>
+    private void CheckSessionFlatten()
     {
         if (_state is not (TradeState.Entering or TradeState.InPosition)) return;
+        if (_tradeDay is not DateTime tradeDay) return;
 
-        DateTime nyNow = ToNewYork(GetCandle(liveBar).Time);
-        if (nyNow.TimeOfDay >= FlattenTime || (_tradeDay is DateTime day && nyNow.Date != day))
-            Flatten($"session flatten time {FlattenTime:hh\\:mm} NY");
+        int newestBar = CurrentBar - 1;
+        if (newestBar < 0) return;
+
+        DateTime nyNow = ToNewYork(GetCandle(newestBar).Time);
+        bool flattenTimeReached = nyNow.Date == tradeDay && nyNow.TimeOfDay >= FlattenTime;
+        bool laterDay = nyNow.Date > tradeDay;
+
+        if (flattenTimeReached || laterDay)
+            Flatten($"session flatten time {FlattenTime:hh\\:mm} NY reached: newest bar NY {nyNow:yyyy-MM-dd HH:mm}, trade day {tradeDay:yyyy-MM-dd}");
     }
 
     /// <summary>Cancels working exit orders and closes any open position at market.</summary>
@@ -851,7 +873,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             $"session={_tracker?.SessionDate:yyyy-MM-dd}, high={_tracker?.High}, low={_tracker?.Low}, " +
             $"complete={_tracker?.IsComplete}, upBroken={_tracker?.UpBroken}, downBroken={_tracker?.DownBroken}, " +
             $"live signals={_liveBreakouts}, trade state={_state}, own position={_ownPosition}, " +
-            $"platform position={CurrentPosition}, trades today={_tradesToday}.");
+            $"platform position={CurrentPosition}, trades today={_tradesToday}, older-bar calls={_olderBarCalls}.");
     }
 
     private static void Trace(string message) => StrategyLog.Trace(TraceFileName, message);
