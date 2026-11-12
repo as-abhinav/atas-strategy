@@ -30,7 +30,7 @@ public enum ChartTimeZoneChoice
 public class OpeningRangeBreakoutStrategy : ChartStrategy
 {
     // Bump this when you rebuild, so the trace log proves which DLL ATAS is running.
-    private const string BuildTag = "2026-11-12 orb-3-replay-fix";
+    private const string BuildTag = "2026-11-12 orb-4-own-position";
     private const string TraceFileName = "OpeningRangeTrace.log";
     private const string SignalFileName = "OpeningRangeSignals.csv";
     private const string SignalHeader = "bar_time_ny,bar_time_chart,direction,price,range_high,range_low,mode";
@@ -68,6 +68,13 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     private TradePlan? _plan;
     private DateTime? _tradeDay;
     private int _tradesToday;
+
+    // The strategy's own position, signed (+long / -short), updated from its own fills.
+    // ATAS's CurrentPosition can lag a fill by seconds, so exit decisions use this instead.
+    private decimal _ownPosition;
+
+    // A flatten was requested while the entry order was still working: close it as soon as it fills.
+    private bool _flattenRequested;
 
     // Trace log state.
     private int _calculateCalls;
@@ -409,8 +416,8 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                 _tradesToday = 0;
             }
 
-            if (_state != TradeState.Flat || CurrentPosition != 0)
-                return NoTrade($"already in a trade (state={_state}, position={CurrentPosition})");
+            if (_state != TradeState.Flat || _ownPosition != 0)
+                return NoTrade($"already in a trade (state={_state}, own position={_ownPosition})");
 
             if (_tradesToday >= MaxTradesPerDay)
                 return NoTrade($"max trades per day reached ({_tradesToday})");
@@ -429,8 +436,10 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             _entryOrder = entry;
         }
 
-        Trace($"ENTRY: market {entry.Direction} {Quantity}. Planned stop {_plan!.Stop}, target {_plan.Target} (risk {_plan.Risk}).");
-        LogTrade("entry_sent", entry.Direction, Quantity, breakout.Price, _plan!.Stop, _plan.Target, "market");
+        Trace($"ENTRY: market {entry.Direction} {Quantity}. Stop placement {StopMode}: planned stop {_plan!.Stop}, " +
+              $"target {_plan.Target} ({TargetR}R, risk {_plan.Risk}).");
+        LogTrade("entry_sent", entry.Direction, Quantity, breakout.Price, _plan!.Stop, _plan.Target,
+            $"market; stop placement {StopMode}; target {TargetR}R; risk {_plan.Risk}");
         _ = SendAsync(entry, "Entry");
         return $"TRADE: market {entry.Direction} {Quantity} sent, stop {_plan.Stop}, target {_plan.Target}.";
     }
@@ -470,7 +479,8 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     {
         try
         {
-            Trace($"Strategy stopping. State={_state}, position={CurrentPosition}, close on stop={ClosePositionOnStop}.");
+            Trace($"Strategy stopping. State={_state}, own position={_ownPosition}, platform position={CurrentPosition}, " +
+                  $"close on stop={ClosePositionOnStop}.");
             if (ClosePositionOnStop)
                 Flatten("strategy stopping");
         }
@@ -500,8 +510,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                 {
                     Trace($"Entry order ended without a fill (state={order.State}, status={status}).");
                     LogTrade("entry_failed", order.Direction, Quantity, 0, 0, 0, $"{order.State}/{status}");
-                    _entryOrder = null;
-                    _state = TradeState.Flat;
+                    ClearTrade();
                     return;
                 }
 
@@ -510,16 +519,23 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
 
                 _entryOrder = null;
                 _state = TradeState.InPosition;
+                var b = _activeBreakout!;
+                _ownPosition = b.Direction == BreakoutDirection.Up ? Quantity : -Quantity;
 
                 // Recompute the target from the actual fill price; the stop stays on the range.
                 decimal fill = AveragePrice > 0 ? AveragePrice : _plan!.Entry;
-                var b = _activeBreakout!;
                 var plan = OrbTradePlanner.Build(b.Direction, fill, b.RangeHigh, b.RangeLow, StopMode, TargetR);
 
-                Trace($"Entry filled at {fill}. Position={CurrentPosition}.");
-                LogTrade("entry_filled", order.Direction, Quantity, fill, plan?.Stop ?? 0, plan?.Target ?? 0, "");
+                Trace($"Entry filled at {fill}. Own position={_ownPosition} (platform reports {CurrentPosition}).");
+                LogTrade("entry_filled", order.Direction, Quantity, fill, plan?.Stop ?? 0, plan?.Target ?? 0,
+                    AveragePrice > 0 ? "fill price from platform" : "fill price not reported yet; planned entry used");
 
-                if (plan is null)
+                if (_flattenRequested)
+                {
+                    flatten = true;
+                    flattenReason = "flatten was requested before the entry filled";
+                }
+                else if (plan is null)
                 {
                     flatten = true;
                     flattenReason = "fill is beyond the stop";
@@ -532,6 +548,8 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                     placeTarget = NewOrder(exitSide, OrderTypes.Limit, Quantity, price: ShrinkPrice(plan.Target));
                     _stopOrder = placeStop;
                     _targetOrder = placeTarget;
+                    LogTrade("stop_sent", exitSide, Quantity, placeStop.TriggerPrice, plan.Stop, plan.Target, $"stop; placement {StopMode}");
+                    LogTrade("target_sent", exitSide, Quantity, placeTarget.Price, plan.Stop, plan.Target, $"limit; {TargetR}R");
                 }
             }
             else if (order == _stopOrder || order == _targetOrder)
@@ -543,9 +561,11 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                 if (status == OrderStatus.Filled)
                 {
                     cancel = isStop ? _targetOrder : _stopOrder;
-                    Trace($"{which} filled. Cancelling the other exit order.");
+                    Trace($"{which} filled. Own position now 0. Cancelling the other exit order.");
                     LogTrade(isStop ? "stop_filled" : "target_filled", order.Direction, Quantity,
-                        isStop ? order.TriggerPrice : order.Price, _plan?.Stop ?? 0, _plan?.Target ?? 0, "");
+                        isStop ? order.TriggerPrice : order.Price, _plan?.Stop ?? 0, _plan?.Target ?? 0,
+                        isStop ? "order trigger price; actual fill may slip" : "limit price");
+                    _ownPosition = 0;
                     ClearTrade();
                 }
                 else if (order.State == OrderStates.Failed || status == OrderStatus.Canceled)
@@ -560,8 +580,11 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                 var status = order.Status();
                 if (status == OrderStatus.Filled)
                 {
-                    Trace("Flatten order filled. Position closed.");
-                    LogTrade("flatten_filled", order.Direction, order.QuantityToFill, 0, 0, 0, "");
+                    decimal approxExit = LastPrice();
+                    Trace($"Flatten order filled near {approxExit}. Own position now 0.");
+                    LogTrade("flatten_filled", order.Direction, order.QuantityToFill, approxExit, _plan?.Stop ?? 0, _plan?.Target ?? 0,
+                        "approximate: last traded price when the fill was reported");
+                    _ownPosition = 0;
                     ClearTrade();
                 }
                 else if (order.State == OrderStates.Failed || status == OrderStatus.Canceled)
@@ -589,8 +612,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             {
                 Trace($"Entry order failed: {reason}.");
                 LogTrade("entry_failed", order.Direction, Quantity, 0, 0, 0, reason);
-                _entryOrder = null;
-                _state = TradeState.Flat;
+                ClearTrade();
             }
             else if (order == _stopOrder || order == _targetOrder)
             {
@@ -629,14 +651,19 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         {
             if (_state == TradeState.Exiting) return;
 
+            // Entry still working and already asked to flatten: nothing new to do until it fills or is cancelled.
+            if (_flattenRequested && _ownPosition == 0) return;
+
             cancelStop = _stopOrder;
             cancelTarget = _targetOrder;
-            cancelEntry = _entryOrder;
             _stopOrder = null;
             _targetOrder = null;
-            _entryOrder = null;
 
-            decimal position = CurrentPosition;
+            // Keep the entry order reference: if it fills after being cancelled, the fill handler closes it.
+            cancelEntry = _state == TradeState.Entering ? _entryOrder : null;
+            if (cancelEntry is not null) _flattenRequested = true;
+
+            decimal position = _ownPosition;
             if (position != 0)
             {
                 var side = position > 0 ? OrderDirections.Sell : OrderDirections.Buy;
@@ -644,13 +671,16 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
                 _exitOrder = exit;
                 _state = TradeState.Exiting;
             }
-            else
+            else if (cancelEntry is null)
             {
                 ClearTrade();
             }
         }
 
-        Trace($"FLATTEN ({reason}): position={CurrentPosition}, cancelling working orders.");
+        Trace($"FLATTEN ({reason}): own position={_ownPosition}, platform position={CurrentPosition}, cancelling working orders.");
+        if (_ownPosition == 0 && CurrentPosition != 0)
+            Trace($"WARNING: the platform reports position {CurrentPosition} that this strategy did not open (manual or another " +
+                  "strategy). It is not closed by this strategy.");
         bool hadSomething = exit is not null || cancelStop is not null || cancelTarget is not null || cancelEntry is not null;
         if (hadSomething)
             LogTrade("flatten", exit?.Direction ?? OrderDirections.Sell, exit?.QuantityToFill ?? 0, 0, 0, 0, reason);
@@ -664,6 +694,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     private void ClearTrade()
     {
         _state = TradeState.Flat;
+        _flattenRequested = false;
         _entryOrder = null;
         _stopOrder = null;
         _targetOrder = null;
@@ -724,6 +755,19 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         catch (Exception ex)
         {
             Trace($"Cancel of {order.Type} order failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Close of the newest bar: an approximation of the current price, for logging exits.</summary>
+    private decimal LastPrice()
+    {
+        try
+        {
+            return CurrentBar > 0 ? (decimal)GetCandle(CurrentBar - 1).Close : 0m;
+        }
+        catch (Exception)
+        {
+            return 0m;
         }
     }
 
@@ -806,7 +850,8 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             $"Heartbeat: calls={_calculateCalls}, bar={bar}, CurrentBar={CurrentBar}, " +
             $"session={_tracker?.SessionDate:yyyy-MM-dd}, high={_tracker?.High}, low={_tracker?.Low}, " +
             $"complete={_tracker?.IsComplete}, upBroken={_tracker?.UpBroken}, downBroken={_tracker?.DownBroken}, " +
-            $"live signals={_liveBreakouts}, trade state={_state}, position={CurrentPosition}, trades today={_tradesToday}.");
+            $"live signals={_liveBreakouts}, trade state={_state}, own position={_ownPosition}, " +
+            $"platform position={CurrentPosition}, trades today={_tradesToday}.");
     }
 
     private static void Trace(string message) => StrategyLog.Trace(TraceFileName, message);

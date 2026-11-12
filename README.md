@@ -105,7 +105,11 @@ Off by default. With "Trading enabled" on **and** the strategy started on the ch
 2. On fill, places a stop and a take-profit limit. When one fills, the other is cancelled.
 3. Flattens (cancels exits, closes at market) at the flatten time, when an exit order is rejected, and when the strategy is stopped (if "Close position when stopped" is on).
 
-Use a simulated/demo account. Every order event is in `%APPDATA%\ATAS\Logs\OpeningRangeTrades.csv` and the trace log.
+Use a simulated/demo account. Run **one instance per chart**: every instance writes to the same log files, so two instances make the logs impossible to follow (and both can trade).
+
+Every order event is in `%APPDATA%\ATAS\Logs\OpeningRangeTrades.csv`: `entry_sent` (with the stop placement, target multiple and risk), `entry_filled`, `stop_sent`, `target_sent`, `stop_filled` / `target_filled`, `flatten`, `flatten_filled` (exit price approximated by the last traded price) and `entry_failed`.
+
+The strategy tracks its own position from its own fills. ATAS's reported position can lag a fill by seconds, so exits never depend on it. A position the strategy did not open (manual, or another strategy) is never closed by it; the trace log warns about it instead.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -118,6 +122,6 @@ Use a simulated/demo account. Every order event is in `%APPDATA%\ATAS\Logs\Openi
 | Flatten at (NY) | 15:55 | Open positions are closed at this time. |
 | Close position when stopped | on | Stopping the strategy closes the position and cancels its orders. |
 
-Known limits: partial entry fills wait for the full fill. The stop and target are separate orders managed by the strategy, not a broker-side OCO: if ATAS or the connection goes down, the stop stays working but the target is not cancelled when the stop fills.
+Known limits: partial entry fills wait for the full fill. Settings changed while the strategy runs are not re-logged; the `entry_sent` row shows the stop placement actually used. The stop and target are separate orders managed by the strategy, not a broker-side OCO: if ATAS or the connection goes down, the stop stays working but the target is not cancelled when the stop fills.
 
 Trace log: `%APPDATA%\ATAS\Logs\OpeningRangeTrace.log`. It records the build tag, settings, each session's range with the chart time and the converted NY time, live signals and a heartbeat about once a minute. If the "NY" times in it are not 09:30/10:30 for the open, change "Chart time zone".
