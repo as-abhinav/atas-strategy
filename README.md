@@ -14,6 +14,28 @@ Chart strategies and indicators for classic ATAS on Windows (.NET 10 class libra
 
 Requires the .NET 10 SDK and classic ATAS installed.
 
+### Build and install in one step (Windows)
+
+From the project folder, in Command Prompt or PowerShell:
+
+```bash
+build.cmd
+```
+
+This builds in Release and copies `AtasStrategies.dll` to `C:\Users\ADMIN\AppData\Roaming\ATAS\Strategies`. If tests or the build fail, nothing is copied. If the copy fails because ATAS is using the DLL, close ATAS (or remove the strategies from all charts) and run it again. Options:
+
+```bash
+build.cmd -Test
+```
+
+```bash
+build.cmd -Destination "D:\ATAS\Strategies" -Configuration Debug
+```
+
+`-Test` runs the unit tests first. `build.cmd` runs `build.ps1` with PowerShell's execution policy bypassed for that one run, so no system setting has to change.
+
+### Build only
+
 ```bash
 dotnet build -c Release
 ```
