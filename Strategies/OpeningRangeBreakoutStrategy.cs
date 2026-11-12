@@ -1,6 +1,8 @@
 using System;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Threading.Tasks;
+using ATAS.DataFeedsCore;
 using ATAS.Indicators;
 using ATAS.Strategies.Chart;
 using AtasStrategies.Core;
@@ -17,19 +19,31 @@ public enum ChartTimeZoneChoice
 }
 
 /// <summary>
-/// Signal-only New York opening range breakout. Places no orders.
-/// Marks the high and low of the first hour after the New York open (09:30 ET by default)
-/// and signals when a bar breaks out of that range.
+/// New York opening range breakout.
+/// Marks the high and low of the first hour after the New York open (09:30 ET by default) and signals
+/// when a bar closes outside that range. With "Trading enabled" on and the strategy started, it enters
+/// at market on the breakout, places a stop and a take-profit (when one fills the other is cancelled),
+/// and flattens before the close.
 /// </summary>
-[DisplayName("NY open range breakout (signal only)")]
+[DisplayName("NY open range breakout")]
 [Category("AtasStrategies")]
 public class OpeningRangeBreakoutStrategy : ChartStrategy
 {
     // Bump this when you rebuild, so the trace log proves which DLL ATAS is running.
-    private const string BuildTag = "2026-11-12 orb-1";
+    private const string BuildTag = "2026-11-12 orb-2-trading";
     private const string TraceFileName = "OpeningRangeTrace.log";
     private const string SignalFileName = "OpeningRangeSignals.csv";
     private const string SignalHeader = "bar_time_ny,bar_time_chart,direction,price,range_high,range_low,mode";
+    private const string TradeFileName = "OpeningRangeTrades.csv";
+    private const string TradeHeader = "time,event,direction,quantity,price,stop,target,detail";
+
+    private enum TradeState
+    {
+        Flat,
+        Entering,
+        InPosition,
+        Exiting,
+    }
 
     private readonly ValueDataSeries _rangeHigh;
     private readonly ValueDataSeries _rangeLow;
@@ -42,6 +56,18 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     private decimal? _lastLow;
     private bool _backfilled;
     private DateTime? _lastTracedSession;
+
+    // Trading state. Order callbacks may arrive on another thread, so all of it is guarded by _sync.
+    private readonly object _sync = new();
+    private TradeState _state = TradeState.Flat;
+    private Order? _entryOrder;
+    private Order? _stopOrder;
+    private Order? _targetOrder;
+    private Order? _exitOrder;
+    private RangeBreakout? _activeBreakout;
+    private TradePlan? _plan;
+    private DateTime? _tradeDay;
+    private int _tradesToday;
 
     // Trace log state.
     private int _calculateCalls;
@@ -92,6 +118,53 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     [OFT.Attributes.Parameter]
     public bool FirstBreakoutOnly { get; set; }
 
+    [Display(Name = "Trading enabled", GroupName = "Trading", Order = 10)]
+    [OFT.Attributes.Parameter]
+    public bool TradingEnabled { get; set; }
+
+    [Display(Name = "Quantity (contracts)", GroupName = "Trading", Order = 20)]
+    [Range(1, 1000)]
+    [OFT.Attributes.Parameter]
+    public decimal Quantity { get; set; } = 1;
+
+    [Display(Name = "Stop placement", GroupName = "Trading", Order = 30)]
+    [OFT.Attributes.Parameter]
+    public StopPlacement StopMode { get; set; } = StopPlacement.RangeMidpoint;
+
+    [Display(Name = "Target (multiple of risk)", GroupName = "Trading", Order = 40)]
+    [Range(0.1, 20)]
+    [OFT.Attributes.Parameter]
+    public decimal TargetR { get; set; } = 2m;
+
+    [Display(Name = "Max trades per day", GroupName = "Trading", Order = 50)]
+    [Range(1, 20)]
+    [OFT.Attributes.Parameter]
+    public int MaxTradesPerDay { get; set; } = 1;
+
+    [Display(Name = "No new entries after hour (NY)", GroupName = "Trading", Order = 60)]
+    [Range(0, 23)]
+    [OFT.Attributes.Parameter]
+    public int EntryCutoffHour { get; set; } = 15;
+
+    [Display(Name = "No new entries after minute (NY)", GroupName = "Trading", Order = 70)]
+    [Range(0, 59)]
+    [OFT.Attributes.Parameter]
+    public int EntryCutoffMinute { get; set; }
+
+    [Display(Name = "Flatten at hour (NY)", GroupName = "Trading", Order = 80)]
+    [Range(0, 23)]
+    [OFT.Attributes.Parameter]
+    public int FlattenHour { get; set; } = 15;
+
+    [Display(Name = "Flatten at minute (NY)", GroupName = "Trading", Order = 90)]
+    [Range(0, 59)]
+    [OFT.Attributes.Parameter]
+    public int FlattenMinute { get; set; } = 55;
+
+    [Display(Name = "Close position when stopped", GroupName = "Trading", Order = 100)]
+    [OFT.Attributes.Parameter]
+    public bool ClosePositionOnStop { get; set; } = true;
+
     [Display(Name = "Draw range lines", GroupName = "Visuals", Order = 10)]
     [OFT.Attributes.Parameter]
     public bool DrawRange { get; set; } = true;
@@ -137,6 +210,8 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         Trace($"Strategy created. Build: {BuildTag}.");
     }
 
+    // ---------------------------------------------------------------- calculation
+
     protected override void OnCalculate(int bar, decimal value)
     {
         try
@@ -153,17 +228,22 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             while (_nextBarToProcess < bar)
             {
                 bool newestClosedBar = isLiveBar && _nextBarToProcess == bar - 1;
-                ProcessClosedBar(_nextBarToProcess, newestClosedBar);
+                ProcessClosedBar(_nextBarToProcess, newestClosedBar, bar);
                 _nextBarToProcess++;
             }
 
             // Extend the lines onto the forming bar.
             PaintRange(bar);
 
-            if (isLiveBar && !_liveBarTraced && bar >= 1)
+            if (isLiveBar && bar >= 1)
             {
-                _liveBarTraced = true;
-                TraceLiveStart(bar);
+                if (!_liveBarTraced)
+                {
+                    _liveBarTraced = true;
+                    TraceLiveStart(bar);
+                }
+
+                CheckSessionFlatten(bar);
             }
 
             TraceHeartbeat(bar);
@@ -197,11 +277,14 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
 
         Trace(
             $"Calculation started. CurrentBar={CurrentBar}. Settings: chart time zone={ChartTimeZone}, " +
-            $"open={sessionStart:hh\\:mm} NY, range={RangeMinutes} min, stop={stop:hh\\:mm} NY, " +
-            $"mode={Mode}, buffer={BreakoutBuffer}, first breakout only={FirstBreakoutOnly}.");
+            $"open={sessionStart:hh\\:mm} NY, range={RangeMinutes} min, stop signals={stop:hh\\:mm} NY, " +
+            $"mode={Mode}, buffer={BreakoutBuffer}, first breakout only={FirstBreakoutOnly}. " +
+            $"Trading: enabled={TradingEnabled}, qty={Quantity}, stop={StopMode}, target={TargetR}R, " +
+            $"max trades/day={MaxTradesPerDay}, entry cutoff={EntryCutoff:hh\\:mm}, flatten={FlattenTime:hh\\:mm}, " +
+            $"close on stop={ClosePositionOnStop}.");
     }
 
-    private void ProcessClosedBar(int index, bool newestClosedBar)
+    private void ProcessClosedBar(int index, bool newestClosedBar, int liveBar)
     {
         var candle = GetCandle(index);
         DateTime ny = ToNewYork(candle.Time);
@@ -253,7 +336,384 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             breakout.RangeHigh,
             breakout.RangeLow,
             Mode));
+
+        TryEnter(breakout, liveBar);
     }
+
+    // ---------------------------------------------------------------- trading
+
+    private TimeSpan EntryCutoff => new(EntryCutoffHour, EntryCutoffMinute, 0);
+
+    private TimeSpan FlattenTime => new(FlattenHour, FlattenMinute, 0);
+
+    private void TryEnter(RangeBreakout breakout, int liveBar)
+    {
+        if (!TradingEnabled)
+        {
+            Trace("No trade: 'Trading enabled' is off (signal only).");
+            return;
+        }
+
+        // CanProcess is true only for the last bar of a started strategy.
+        if (!CanProcess(liveBar))
+        {
+            Trace("No trade: strategy is not started (CanProcess=false).");
+            return;
+        }
+
+        DateTime nyNow = ToNewYork(GetCandle(liveBar).Time);
+        if (nyNow.TimeOfDay >= EntryCutoff)
+        {
+            Trace($"No trade: past the entry cutoff {EntryCutoff:hh\\:mm} NY.");
+            return;
+        }
+
+        Order entry;
+        lock (_sync)
+        {
+            if (_tradeDay != nyNow.Date)
+            {
+                _tradeDay = nyNow.Date;
+                _tradesToday = 0;
+            }
+
+            if (_state != TradeState.Flat || CurrentPosition != 0)
+            {
+                Trace($"No trade: already busy (state={_state}, position={CurrentPosition}).");
+                return;
+            }
+
+            if (_tradesToday >= MaxTradesPerDay)
+            {
+                Trace($"No trade: max trades per day reached ({_tradesToday}).");
+                return;
+            }
+
+            var plan = OrbTradePlanner.Build(
+                breakout.Direction, breakout.Price, breakout.RangeHigh, breakout.RangeLow, StopMode, TargetR);
+            if (plan is null)
+            {
+                Trace("No trade: entry is already beyond the stop (no valid risk).");
+                return;
+            }
+
+            _activeBreakout = breakout;
+            _plan = plan;
+            _state = TradeState.Entering;
+            _tradesToday++;
+
+            entry = NewOrder(EntryDirection(breakout.Direction), OrderTypes.Market, Quantity);
+            _entryOrder = entry;
+        }
+
+        Trace($"ENTRY: market {entry.Direction} {Quantity}. Planned stop {_plan!.Stop}, target {_plan.Target} (risk {_plan.Risk}).");
+        LogTrade("entry_sent", entry.Direction, Quantity, breakout.Price, _plan!.Stop, _plan.Target, "market");
+        _ = SendAsync(entry, "Entry");
+    }
+
+    protected override void OnOrderChanged(Order order)
+    {
+        try
+        {
+            HandleOrderChanged(order);
+        }
+        catch (Exception ex)
+        {
+            Trace($"ERROR in OnOrderChanged: {ex}");
+            this.LogError("Opening range order handling failed.", ex);
+        }
+    }
+
+    protected override void OnOrderRegisterFailed(Order order, string message)
+    {
+        try
+        {
+            HandleOrderFailure(order, $"register failed: {message}");
+        }
+        catch (Exception ex)
+        {
+            Trace($"ERROR in OnOrderRegisterFailed: {ex}");
+        }
+    }
+
+    protected override void OnStopping()
+    {
+        try
+        {
+            Trace($"Strategy stopping. State={_state}, position={CurrentPosition}, close on stop={ClosePositionOnStop}.");
+            if (ClosePositionOnStop)
+                Flatten("strategy stopping");
+        }
+        catch (Exception ex)
+        {
+            Trace($"ERROR in OnStopping: {ex}");
+        }
+
+        base.OnStopping();
+    }
+
+    private void HandleOrderChanged(Order order)
+    {
+        Order? placeStop = null;
+        Order? placeTarget = null;
+        Order? cancel = null;
+        bool flatten = false;
+        string? flattenReason = null;
+
+        lock (_sync)
+        {
+            if (order == _entryOrder)
+            {
+                var status = order.Status();
+
+                if (order.State == OrderStates.Failed || status == OrderStatus.Canceled)
+                {
+                    Trace($"Entry order ended without a fill (state={order.State}, status={status}).");
+                    LogTrade("entry_failed", order.Direction, Quantity, 0, 0, 0, $"{order.State}/{status}");
+                    _entryOrder = null;
+                    _state = TradeState.Flat;
+                    return;
+                }
+
+                if (status != OrderStatus.Filled || _state != TradeState.Entering)
+                    return; // placed or partly filled: wait for the fill
+
+                _entryOrder = null;
+                _state = TradeState.InPosition;
+
+                // Recompute the target from the actual fill price; the stop stays on the range.
+                decimal fill = AveragePrice > 0 ? AveragePrice : _plan!.Entry;
+                var b = _activeBreakout!;
+                var plan = OrbTradePlanner.Build(b.Direction, fill, b.RangeHigh, b.RangeLow, StopMode, TargetR);
+
+                Trace($"Entry filled at {fill}. Position={CurrentPosition}.");
+                LogTrade("entry_filled", order.Direction, Quantity, fill, plan?.Stop ?? 0, plan?.Target ?? 0, "");
+
+                if (plan is null)
+                {
+                    flatten = true;
+                    flattenReason = "fill is beyond the stop";
+                }
+                else
+                {
+                    _plan = plan;
+                    var exitSide = ExitDirection(b.Direction);
+                    placeStop = NewOrder(exitSide, OrderTypes.Stop, Quantity, triggerPrice: ShrinkPrice(plan.Stop));
+                    placeTarget = NewOrder(exitSide, OrderTypes.Limit, Quantity, price: ShrinkPrice(plan.Target));
+                    _stopOrder = placeStop;
+                    _targetOrder = placeTarget;
+                }
+            }
+            else if (order == _stopOrder || order == _targetOrder)
+            {
+                bool isStop = order == _stopOrder;
+                string which = isStop ? "Stop" : "Target";
+                var status = order.Status();
+
+                if (status == OrderStatus.Filled)
+                {
+                    cancel = isStop ? _targetOrder : _stopOrder;
+                    Trace($"{which} filled. Cancelling the other exit order.");
+                    LogTrade(isStop ? "stop_filled" : "target_filled", order.Direction, Quantity,
+                        isStop ? order.TriggerPrice : order.Price, _plan?.Stop ?? 0, _plan?.Target ?? 0, "");
+                    ClearTrade();
+                }
+                else if (order.State == OrderStates.Failed || status == OrderStatus.Canceled)
+                {
+                    // An exit we did not cancel ourselves is gone: the position is unprotected.
+                    flatten = true;
+                    flattenReason = $"{which.ToLowerInvariant()} order ended unexpectedly ({order.State}/{status})";
+                }
+            }
+            else if (order == _exitOrder)
+            {
+                var status = order.Status();
+                if (status == OrderStatus.Filled)
+                {
+                    Trace("Flatten order filled. Position closed.");
+                    LogTrade("flatten_filled", order.Direction, order.QuantityToFill, 0, 0, 0, "");
+                    ClearTrade();
+                }
+                else if (order.State == OrderStates.Failed || status == OrderStatus.Canceled)
+                {
+                    Trace($"FLATTEN ORDER FAILED ({order.State}/{status}). Close the position manually.");
+                    RaiseShowNotification("Opening range strategy: flatten order failed. Close the position manually.");
+                    _exitOrder = null;
+                }
+            }
+        }
+
+        if (placeStop is not null) _ = SendAsync(placeStop, "Stop");
+        if (placeTarget is not null) _ = SendAsync(placeTarget, "Target");
+        if (cancel is not null) _ = CancelAsync(cancel);
+        if (flatten) Flatten(flattenReason!);
+    }
+
+    private void HandleOrderFailure(Order order, string reason)
+    {
+        bool flatten = false;
+
+        lock (_sync)
+        {
+            if (order == _entryOrder)
+            {
+                Trace($"Entry order failed: {reason}.");
+                LogTrade("entry_failed", order.Direction, Quantity, 0, 0, 0, reason);
+                _entryOrder = null;
+                _state = TradeState.Flat;
+            }
+            else if (order == _stopOrder || order == _targetOrder)
+            {
+                Trace($"Exit order failed: {reason}. Flattening.");
+                flatten = true;
+            }
+            else if (order == _exitOrder)
+            {
+                Trace($"FLATTEN ORDER FAILED: {reason}. Close the position manually.");
+                RaiseShowNotification("Opening range strategy: flatten order failed. Close the position manually.");
+                _exitOrder = null;
+            }
+        }
+
+        if (flatten) Flatten("exit order failed");
+    }
+
+    private void CheckSessionFlatten(int liveBar)
+    {
+        if (_state is not (TradeState.Entering or TradeState.InPosition)) return;
+
+        DateTime nyNow = ToNewYork(GetCandle(liveBar).Time);
+        if (nyNow.TimeOfDay >= FlattenTime || (_tradeDay is DateTime day && nyNow.Date != day))
+            Flatten($"session flatten time {FlattenTime:hh\\:mm} NY");
+    }
+
+    /// <summary>Cancels working exit orders and closes any open position at market.</summary>
+    private void Flatten(string reason)
+    {
+        Order? cancelStop;
+        Order? cancelTarget;
+        Order? cancelEntry;
+        Order? exit = null;
+
+        lock (_sync)
+        {
+            if (_state == TradeState.Exiting) return;
+
+            cancelStop = _stopOrder;
+            cancelTarget = _targetOrder;
+            cancelEntry = _entryOrder;
+            _stopOrder = null;
+            _targetOrder = null;
+            _entryOrder = null;
+
+            decimal position = CurrentPosition;
+            if (position != 0)
+            {
+                var side = position > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                exit = NewOrder(side, OrderTypes.Market, Math.Abs(position));
+                _exitOrder = exit;
+                _state = TradeState.Exiting;
+            }
+            else
+            {
+                ClearTrade();
+            }
+        }
+
+        Trace($"FLATTEN ({reason}): position={CurrentPosition}, cancelling working orders.");
+        LogTrade("flatten", exit?.Direction ?? OrderDirections.Sell, exit?.QuantityToFill ?? 0, 0, 0, 0, reason);
+
+        if (cancelEntry is not null) _ = CancelAsync(cancelEntry);
+        if (cancelStop is not null) _ = CancelAsync(cancelStop);
+        if (cancelTarget is not null) _ = CancelAsync(cancelTarget);
+        if (exit is not null) _ = SendAsync(exit, "Flatten");
+    }
+
+    private void ClearTrade()
+    {
+        _state = TradeState.Flat;
+        _entryOrder = null;
+        _stopOrder = null;
+        _targetOrder = null;
+        _exitOrder = null;
+        _activeBreakout = null;
+        _plan = null;
+    }
+
+    private Order NewOrder(
+        OrderDirections direction,
+        OrderTypes type,
+        decimal quantity,
+        decimal price = 0,
+        decimal triggerPrice = 0)
+    {
+        var order = new Order
+        {
+            Portfolio = Portfolio,
+            Security = Security,
+            Direction = direction,
+            Type = type,
+            QuantityToFill = quantity,
+        };
+
+        if (type == OrderTypes.Limit) order.Price = price;
+        if (type == OrderTypes.Stop) order.TriggerPrice = triggerPrice;
+        return order;
+    }
+
+    private async Task SendAsync(Order order, string label)
+    {
+        try
+        {
+            await OpenOrderAsync(order);
+
+            var status = order.Status();
+            Trace($"{label} order sent: {order.Direction} {order.Type} qty={order.QuantityToFill} " +
+                  $"price={order.Price} trigger={order.TriggerPrice}. Status={status}, state={order.State}.");
+
+            // None means it was not sent (not started, trading blocked, or volume check failed).
+            if (status == OrderStatus.None)
+                HandleOrderFailure(order, "not sent (status None)");
+        }
+        catch (Exception ex)
+        {
+            HandleOrderFailure(order, $"rejected: {ex.Message}");
+        }
+    }
+
+    private async Task CancelAsync(Order order)
+    {
+        try
+        {
+            if (order.State != OrderStates.Active) return;
+            await CancelOrderAsync(order);
+            Trace($"Cancelled {order.Type} order.");
+        }
+        catch (Exception ex)
+        {
+            Trace($"Cancel of {order.Type} order failed: {ex.Message}");
+        }
+    }
+
+    private static OrderDirections EntryDirection(BreakoutDirection d) =>
+        d == BreakoutDirection.Up ? OrderDirections.Buy : OrderDirections.Sell;
+
+    private static OrderDirections ExitDirection(BreakoutDirection d) =>
+        d == BreakoutDirection.Up ? OrderDirections.Sell : OrderDirections.Buy;
+
+    private static void LogTrade(
+        string evt, OrderDirections direction, decimal quantity, decimal price, decimal stop, decimal target, string detail) =>
+        StrategyLog.AppendCsv(TradeFileName, TradeHeader, string.Join(",",
+            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            evt,
+            direction,
+            quantity,
+            price,
+            stop,
+            target,
+            "\"" + detail.Replace("\"", "'") + "\""));
+
+    // ---------------------------------------------------------------- drawing, time, logging
 
     /// <summary>
     /// Writes the current range onto a bar. Bars before the first known range are backfilled once,
@@ -296,10 +756,12 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             $"Last closed bar: chart time {last.Time:yyyy-MM-dd HH:mm} = NY {ToNewYork(last.Time):yyyy-MM-dd HH:mm} " +
             $"(chart time zone setting: {ChartTimeZone}, this PC: {TimeZoneInfo.Local.Id}). " +
             $"Current session {_tracker?.SessionDate:yyyy-MM-dd}: high={_tracker?.High}, low={_tracker?.Low}, " +
-            $"complete={_tracker?.IsComplete}. Breakouts found in history: {_historicalBreakouts}.");
+            $"complete={_tracker?.IsComplete}. Breakouts found in history: {_historicalBreakouts}. " +
+            $"Portfolio: {Portfolio}. Trading enabled: {TradingEnabled}.");
 
+        string mode = TradingEnabled ? $"TRADING ON, qty {Quantity}" : "signals only (Trading enabled is off)";
         RaiseShowNotification(
-            $"NY open range strategy running (build {BuildTag}). Trace log: %APPDATA%\\ATAS\\Logs\\{TraceFileName}");
+            $"NY open range strategy running (build {BuildTag}), {mode}. Trace log: %APPDATA%\\ATAS\\Logs\\{TraceFileName}");
     }
 
     private void TraceHeartbeat(int bar)
@@ -312,7 +774,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             $"Heartbeat: calls={_calculateCalls}, bar={bar}, CurrentBar={CurrentBar}, " +
             $"session={_tracker?.SessionDate:yyyy-MM-dd}, high={_tracker?.High}, low={_tracker?.Low}, " +
             $"complete={_tracker?.IsComplete}, upBroken={_tracker?.UpBroken}, downBroken={_tracker?.DownBroken}, " +
-            $"live signals={_liveBreakouts}.");
+            $"live signals={_liveBreakouts}, trade state={_state}, position={CurrentPosition}, trades today={_tradesToday}.");
     }
 
     private static void Trace(string message) => StrategyLog.Trace(TraceFileName, message);

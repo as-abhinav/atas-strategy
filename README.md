@@ -58,7 +58,7 @@ Verified: the strategy compiles against stub ATAS types. Not yet verified: the r
 
 ## Strategy 2: NY open range breakout
 
-`Strategies/OpeningRangeBreakoutStrategy.cs` ("NY open range breakout (signal only)" in ATAS). Places no orders.
+`Strategies/OpeningRangeBreakoutStrategy.cs` ("NY open range breakout" in ATAS). Signals only, unless "Trading enabled" is turned on (see Trading below).
 
 - Marks the high and low of the first hour after the New York open (09:30-10:30 ET by default) as two lines.
 - Signals when a closed bar breaks out of that range: a notification, a marker on the chart, and a line in `%APPDATA%\ATAS\Logs\OpeningRangeSignals.csv`. Breakouts in history are marked on the chart but not notified.
@@ -74,5 +74,28 @@ Verified: the strategy compiles against stub ATAS types. Not yet verified: the r
 | Breakout buffer (price points) | 0 | Extra distance beyond the range required for a breakout. |
 | First breakout only | off | When on, only the first breakout of the session is signalled. |
 | Draw range lines / markers | on | Chart visuals. |
+
+### Trading
+
+Off by default. With "Trading enabled" on **and** the strategy started on the chart, each live breakout:
+
+1. Enters at market (Quantity contracts) in the breakout direction.
+2. On fill, places a stop and a take-profit limit. When one fills, the other is cancelled.
+3. Flattens (cancels exits, closes at market) at the flatten time, when an exit order is rejected, and when the strategy is stopped (if "Close position when stopped" is on).
+
+Use a simulated/demo account. Every order event is in `%APPDATA%\ATAS\Logs\OpeningRangeTrades.csv` and the trace log.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Trading enabled | off | Must be on for any order to be sent. |
+| Quantity (contracts) | 1 | Entry size. |
+| Stop placement | RangeMidpoint | RangeMidpoint or OppositeSide of the opening range. |
+| Target (multiple of risk) | 2 | Take-profit distance as a multiple of entry-to-stop, using the actual fill price. |
+| Max trades per day | 1 | Entries per NY session. |
+| No new entries after (NY) | 15:00 | Breakouts after this time are not traded. |
+| Flatten at (NY) | 15:55 | Open positions are closed at this time. |
+| Close position when stopped | on | Stopping the strategy closes the position and cancels its orders. |
+
+Known limits: partial entry fills wait for the full fill. The stop and target are separate orders managed by the strategy, not a broker-side OCO: if ATAS or the connection goes down, the stop stays working but the target is not cancelled when the stop fills.
 
 Trace log: `%APPDATA%\ATAS\Logs\OpeningRangeTrace.log`. It records the build tag, settings, each session's range with the chart time and the converted NY time, live signals and a heartbeat about once a minute. If the "NY" times in it are not 09:30/10:30 for the open, change "Chart time zone".
