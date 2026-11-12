@@ -30,7 +30,7 @@ public enum ChartTimeZoneChoice
 public class OpeningRangeBreakoutStrategy : ChartStrategy
 {
     // Bump this when you rebuild, so the trace log proves which DLL ATAS is running.
-    private const string BuildTag = "2026-11-12 orb-2-trading";
+    private const string BuildTag = "2026-11-12 orb-3-replay-fix";
     private const string TraceFileName = "OpeningRangeTrace.log";
     private const string SignalFileName = "OpeningRangeSignals.csv";
     private const string SignalHeader = "bar_time_ny,bar_time_chart,direction,price,range_high,range_low,mode";
@@ -75,6 +75,14 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     private int _liveBreakouts;
     private bool _liveBarTraced;
     private DateTime _lastHeartbeatUtc = DateTime.MinValue;
+
+    // Index of the forming bar when the chart first reached its last bar; -1 while loading history.
+    // Every bar that closes from then on is live, even if ATAS (e.g. a fast replay) has already
+    // appended newer bars by the time it is calculated.
+    private int _firstLiveBar = -1;
+
+    // Set when the settings are invalid; the strategy stays idle (and quiet) until they are fixed.
+    private string? _settingsError;
 
     [Display(Name = "Chart time zone", GroupName = "Session", Order = 10)]
     [OFT.Attributes.Parameter]
@@ -220,22 +228,35 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             if (_calculateCalls <= 3)
                 Trace($"OnCalculate call #{_calculateCalls}: bar={bar}, CurrentBar={CurrentBar}.");
 
-            if (bar == 0 || _tracker is null)
+            if (bar == 0)
+            {
+                _settingsError = null;
                 StartCalculation();
+            }
+            else if (_tracker is null && _settingsError is null)
+            {
+                StartCalculation();
+            }
+
+            if (_tracker is null)
+                return; // invalid settings: already reported once by StartCalculation
+
+            bool isLiveBar = bar >= CurrentBar - 1;
+            if (isLiveBar && _firstLiveBar < 0)
+                _firstLiveBar = bar;
 
             // Process every closed bar, in order. The forming bar (index "bar") is processed once it closes.
-            bool isLiveBar = bar >= CurrentBar - 1;
             while (_nextBarToProcess < bar)
             {
-                bool newestClosedBar = isLiveBar && _nextBarToProcess == bar - 1;
-                ProcessClosedBar(_nextBarToProcess, newestClosedBar, bar);
+                bool liveClosedBar = _firstLiveBar >= 0 && _nextBarToProcess >= _firstLiveBar - 1;
+                ProcessClosedBar(_nextBarToProcess, liveClosedBar);
                 _nextBarToProcess++;
             }
 
             // Extend the lines onto the forming bar.
             PaintRange(bar);
 
-            if (isLiveBar && bar >= 1)
+            if (_firstLiveBar >= 0 && bar >= 1)
             {
                 if (!_liveBarTraced)
                 {
@@ -260,13 +281,29 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         var sessionStart = new TimeSpan(OpenHour, OpenMinute, 0);
         var stop = new TimeSpan(StopHour, StopMinute, 0);
 
-        _tracker = new OpeningRangeTracker(
-            sessionStart,
-            TimeSpan.FromMinutes(RangeMinutes),
-            stop,
-            BreakoutBuffer,
-            Mode,
-            FirstBreakoutOnly);
+        _firstLiveBar = -1;
+        _liveBarTraced = false;
+
+        try
+        {
+            _tracker = new OpeningRangeTracker(
+                sessionStart,
+                TimeSpan.FromMinutes(RangeMinutes),
+                stop,
+                BreakoutBuffer,
+                Mode,
+                FirstBreakoutOnly);
+        }
+        catch (ArgumentException ex)
+        {
+            // Report once and stay idle, instead of failing on every bar.
+            _tracker = null;
+            _settingsError = ex.Message;
+            Trace($"INVALID SETTINGS, strategy idle until fixed: {ex.Message} " +
+                  $"(open {sessionStart:hh\\:mm} NY, range {RangeMinutes} min, stop signals {stop:hh\\:mm} NY, buffer {BreakoutBuffer}).");
+            RaiseShowNotification($"NY open range strategy: invalid settings, nothing will run. {ex.Message}");
+            return;
+        }
 
         _nextBarToProcess = 0;
         _lastHigh = null;
@@ -284,7 +321,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             $"close on stop={ClosePositionOnStop}.");
     }
 
-    private void ProcessClosedBar(int index, bool newestClosedBar, int liveBar)
+    private void ProcessClosedBar(int index, bool liveClosedBar)
     {
         var candle = GetCandle(index);
         DateTime ny = ToNewYork(candle.Time);
@@ -315,7 +352,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             else _breakDown[index] = (decimal)candle.High;
         }
 
-        if (!newestClosedBar)
+        if (!liveClosedBar)
         {
             _historicalBreakouts++;
             return;
@@ -325,8 +362,7 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         string direction = breakout.Direction == BreakoutDirection.Up ? "UP" : "DOWN";
         string message =
             $"{direction} breakout of NY opening range ({breakout.RangeLow}-{breakout.RangeHigh}) at {breakout.Price}.";
-        RaiseShowNotification(message);
-        Trace($"LIVE SIGNAL: {message} Bar NY time {ny:yyyy-MM-dd HH:mm}.");
+        Trace($"LIVE SIGNAL: {message} Bar NY time {ny:yyyy-MM-dd HH:mm} (bar {index}, newest bar {CurrentBar - 1}).");
 
         StrategyLog.AppendCsv(SignalFileName, SignalHeader, string.Join(",",
             ny.ToString("yyyy-MM-dd HH:mm"),
@@ -337,7 +373,9 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             breakout.RangeLow,
             Mode));
 
-        TryEnter(breakout, liveBar);
+        // One notification per signal that also says what happened to the trade.
+        string outcome = TryEnter(breakout);
+        RaiseShowNotification($"{message} {outcome}");
     }
 
     // ---------------------------------------------------------------- trading
@@ -346,27 +384,21 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
 
     private TimeSpan FlattenTime => new(FlattenHour, FlattenMinute, 0);
 
-    private void TryEnter(RangeBreakout breakout, int liveBar)
+    /// <summary>Tries to enter on a live breakout. Returns a one-line outcome for the notification.</summary>
+    private string TryEnter(RangeBreakout breakout)
     {
         if (!TradingEnabled)
-        {
-            Trace("No trade: 'Trading enabled' is off (signal only).");
-            return;
-        }
+            return NoTrade("signal only, 'Trading enabled' is off");
 
-        // CanProcess is true only for the last bar of a started strategy.
-        if (!CanProcess(liveBar))
-        {
-            Trace("No trade: strategy is not started (CanProcess=false).");
-            return;
-        }
+        // CanProcess is true only for the last bar of a started strategy, so ask about the newest bar:
+        // the breakout bar itself may no longer be the newest one in a fast replay.
+        int newestBar = CurrentBar - 1;
+        if (!CanProcess(newestBar))
+            return NoTrade("the strategy is not started. Press its start button on the chart before the breakout");
 
-        DateTime nyNow = ToNewYork(GetCandle(liveBar).Time);
+        DateTime nyNow = ToNewYork(GetCandle(newestBar).Time);
         if (nyNow.TimeOfDay >= EntryCutoff)
-        {
-            Trace($"No trade: past the entry cutoff {EntryCutoff:hh\\:mm} NY.");
-            return;
-        }
+            return NoTrade($"past the entry cutoff {EntryCutoff:hh\\:mm} NY");
 
         Order entry;
         lock (_sync)
@@ -378,24 +410,15 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             }
 
             if (_state != TradeState.Flat || CurrentPosition != 0)
-            {
-                Trace($"No trade: already busy (state={_state}, position={CurrentPosition}).");
-                return;
-            }
+                return NoTrade($"already in a trade (state={_state}, position={CurrentPosition})");
 
             if (_tradesToday >= MaxTradesPerDay)
-            {
-                Trace($"No trade: max trades per day reached ({_tradesToday}).");
-                return;
-            }
+                return NoTrade($"max trades per day reached ({_tradesToday})");
 
             var plan = OrbTradePlanner.Build(
                 breakout.Direction, breakout.Price, breakout.RangeHigh, breakout.RangeLow, StopMode, TargetR);
             if (plan is null)
-            {
-                Trace("No trade: entry is already beyond the stop (no valid risk).");
-                return;
-            }
+                return NoTrade("entry is already beyond the stop (no valid risk)");
 
             _activeBreakout = breakout;
             _plan = plan;
@@ -409,6 +432,13 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         Trace($"ENTRY: market {entry.Direction} {Quantity}. Planned stop {_plan!.Stop}, target {_plan.Target} (risk {_plan.Risk}).");
         LogTrade("entry_sent", entry.Direction, Quantity, breakout.Price, _plan!.Stop, _plan.Target, "market");
         _ = SendAsync(entry, "Entry");
+        return $"TRADE: market {entry.Direction} {Quantity} sent, stop {_plan.Stop}, target {_plan.Target}.";
+    }
+
+    private static string NoTrade(string reason)
+    {
+        Trace($"No trade: {reason}.");
+        return $"No trade: {reason}.";
     }
 
     protected override void OnOrderChanged(Order order)
@@ -621,7 +651,9 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         }
 
         Trace($"FLATTEN ({reason}): position={CurrentPosition}, cancelling working orders.");
-        LogTrade("flatten", exit?.Direction ?? OrderDirections.Sell, exit?.QuantityToFill ?? 0, 0, 0, 0, reason);
+        bool hadSomething = exit is not null || cancelStop is not null || cancelTarget is not null || cancelEntry is not null;
+        if (hadSomething)
+            LogTrade("flatten", exit?.Direction ?? OrderDirections.Sell, exit?.QuantityToFill ?? 0, 0, 0, 0, reason);
 
         if (cancelEntry is not null) _ = CancelAsync(cancelEntry);
         if (cancelStop is not null) _ = CancelAsync(cancelStop);
