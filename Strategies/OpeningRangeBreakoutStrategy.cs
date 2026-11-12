@@ -30,7 +30,7 @@ public enum ChartTimeZoneChoice
 public class OpeningRangeBreakoutStrategy : ChartStrategy
 {
     // Bump this when you rebuild, so the trace log proves which DLL ATAS is running.
-    private const string BuildTag = "2026-11-12 orb-5-flatten-fix";
+    private const string BuildTag = "2026-11-12 orb-6-session-summary";
     private const string TraceFileName = "OpeningRangeTrace.log";
     private const string SignalFileName = "OpeningRangeSignals.csv";
     private const string SignalHeader = "bar_time_ny,bar_time_chart,direction,price,range_high,range_low,mode";
@@ -56,6 +56,10 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
     private decimal? _lastLow;
     private bool _backfilled;
     private DateTime? _lastTracedSession;
+
+    // What happened in the current NY session, for the summary line written when the session ends.
+    private string? _sessionUpNote;
+    private string? _sessionDownNote;
 
     // Trading state. Order callbacks may arrive on another thread, so all of it is guarded by _sync.
     private readonly object _sync = new();
@@ -328,6 +332,8 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         _lastLow = null;
         _backfilled = false;
         _lastTracedSession = null;
+        _sessionUpNote = null;
+        _sessionDownNote = null;
         _historicalBreakouts = 0;
 
         Trace(
@@ -344,7 +350,11 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         var candle = GetCandle(index);
         DateTime ny = ToNewYork(candle.Time);
 
-        var breakout = _tracker!.Add(ny, (decimal)candle.High, (decimal)candle.Low, (decimal)candle.Close);
+        // First bar of a new NY day: summarise the day that just ended (the tracker still holds its state).
+        if (_tracker!.SessionDate is DateTime previousSession && ny.Date != previousSession)
+            TraceSessionSummary(previousSession, liveClosedBar);
+
+        var breakout = _tracker.Add(ny, (decimal)candle.High, (decimal)candle.Low, (decimal)candle.Close);
 
         if (_tracker.High is decimal high && _tracker.Low is decimal low)
         {
@@ -370,9 +380,12 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
             else _breakDown[index] = (decimal)candle.High;
         }
 
+        string when = $"{breakout.Price} at NY {ny:HH:mm}";
+
         if (!liveClosedBar)
         {
             _historicalBreakouts++;
+            SetSessionNote(breakout.Direction, $"{when} (history: marked only)");
             return;
         }
 
@@ -394,6 +407,36 @@ public class OpeningRangeBreakoutStrategy : ChartStrategy
         // One notification per signal that also says what happened to the trade.
         string outcome = TryEnter(breakout);
         RaiseShowNotification($"{message} {outcome}");
+        SetSessionNote(breakout.Direction, $"{when} (live: {outcome.TrimEnd('.')})");
+    }
+
+    private void SetSessionNote(BreakoutDirection direction, string note)
+    {
+        if (direction == BreakoutDirection.Up) _sessionUpNote = note;
+        else _sessionDownNote = note;
+    }
+
+    /// <summary>
+    /// One line per NY day: the range and what happened on each side. Written when the first bar of the next
+    /// day is processed, for history and live alike, so every day in the trace can be checked against the chart.
+    /// </summary>
+    private void TraceSessionSummary(DateTime session, bool live)
+    {
+        string source = live ? "live" : "history";
+        string range;
+
+        if (_tracker!.High is not decimal high || _tracker.Low is not decimal low)
+            range = $"no opening range (no bars between {OpenHour:00}:{OpenMinute:00} NY and the end of the range)";
+        else if (!_tracker.IsComplete)
+            range = $"range {low}-{high} not complete (no bar after the range window)";
+        else
+            range = $"range {low}-{high}";
+
+        Trace($"Session {session:yyyy-MM-dd} ({session:ddd}, {source}): {range}; " +
+              $"up breakout: {_sessionUpNote ?? "none"}; down breakout: {_sessionDownNote ?? "none"}.");
+
+        _sessionUpNote = null;
+        _sessionDownNote = null;
     }
 
     // ---------------------------------------------------------------- trading

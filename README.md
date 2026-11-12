@@ -125,3 +125,11 @@ The strategy tracks its own position from its own fills. ATAS's reported positio
 Known limits: partial entry fills wait for the full fill. Settings changed while the strategy runs are not re-logged; the `entry_sent` row shows the stop placement actually used. The stop and target are separate orders managed by the strategy, not a broker-side OCO: if ATAS or the connection goes down, the stop stays working but the target is not cancelled when the stop fills.
 
 Trace log: `%APPDATA%\ATAS\Logs\OpeningRangeTrace.log`. It records the build tag, settings, each session's range with the chart time and the converted NY time, live signals and a heartbeat about once a minute. If the "NY" times in it are not 09:30/10:30 for the open, change "Chart time zone".
+
+At the start of each NY day it writes a one-line summary of the day before, for history and live alike, for example:
+
+```
+Session 2026-01-07 (Wed, live): range 5040-5060; up breakout: 5063 at NY 10:35 (live: TRADE: market Buy 1 sent, stop 5050, target 5089); down breakout: none.
+```
+
+"none" means no bar closed beyond that side of the range before the stop-signals time, so there was nothing to trade. Check a day against the chart with these lines.
